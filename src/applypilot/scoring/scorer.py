@@ -8,20 +8,14 @@ profile and resume file.
 import json
 import logging
 import re
-import socket
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
-
-
-class ScoringUnavailableError(RuntimeError):
-    """Raised when scoring cannot run because the configured LLM is unavailable."""
 
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
@@ -98,28 +92,13 @@ def score_job(resume_text: str, job: dict) -> dict:
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
-    client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.2)
-    return _parse_score_response(response)
-
-
-def _preflight_llm_connection() -> None:
-    """Fail fast when a local OpenAI-compatible LLM endpoint is not listening."""
-    client = get_client()
-    parsed = urlparse(client.base_url)
-    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        return
-
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        with socket.create_connection((parsed.hostname, port), timeout=3):
-            return
-    except OSError as exc:
-        raise ScoringUnavailableError(
-            f"Local LLM endpoint is not reachable at {client.base_url}. "
-            "Start your local OpenAI-compatible server, remove LLM_URL to use Gemini/OpenAI, "
-            "or set LLM_URL to the correct host/port."
-        ) from exc
+        client = get_client()
+        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        return _parse_score_response(response)
+    except Exception as e:
+        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
+        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
@@ -134,7 +113,6 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
-    _preflight_llm_connection()
 
     if rescore:
         query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
@@ -160,29 +138,23 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     results: list[dict] = []
 
     for job in jobs:
-        try:
-            result = score_job(resume_text, job)
-            if result["score"] == 0:
-                errors += 1
-        except Exception as e:
-            errors += 1
-            log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-            result = {"score": None, "keywords": "", "reasoning": f"LLM error: {e}"}
-
+        result = score_job(resume_text, job)
         result["url"] = job["url"]
-        results.append(result)
         completed += 1
 
+        if result["score"] == 0:
+            errors += 1
+
+        results.append(result)
+
         log.info(
-            "[%d/%d] score=%s  %s",
+            "[%d/%d] score=%d  %s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
 
     # Write scores to DB
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
-        if r["score"] is None:
-            continue
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
             (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
