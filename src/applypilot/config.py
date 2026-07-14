@@ -172,11 +172,23 @@ DEFAULTS = {
 
 
 def load_env():
-    """Load environment variables from ~/.applypilot/.env if it exists."""
-    from dotenv import load_dotenv
+    """Load environment variables from ~/.applypilot/.env if it exists.
+
+    If ~/.applypilot/.env exists, treat it as authoritative and do not fall
+    back to a repo-root .env that may contain local development settings.
+    If ~/.applypilot/.env does not define LLM_URL, remove any inherited
+    LLM_URL from the current process so Gemini/OpenAI config is not shadowed.
+    """
+    from dotenv import dotenv_values, load_dotenv
+
     if ENV_PATH.exists():
-        load_dotenv(ENV_PATH)
-    # Also try CWD .env as fallback
+        env_values = dotenv_values(ENV_PATH)
+        load_dotenv(ENV_PATH, override=True)
+        if env_values.get("LLM_URL") in (None, ""):
+            os.environ.pop("LLM_URL", None)
+        return
+
+    # Fallback only when ~/.applypilot/.env is absent.
     load_dotenv()
 
 
