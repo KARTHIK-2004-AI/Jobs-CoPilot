@@ -40,3 +40,24 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Test artifacts
+.pytest_cache/
+coverage.xml
+.coverage
+htmlcov/
+junit-*.xml
+
+# Python cache & test tooling
+.mypy_cache/
+.tox/
+.eggs/
+pip-wheel-metadata/
+
+# Docs / markdown build outputs
+docs/_build/
+docs/.cache/
+# temporary markdown files
+*~
+*.md~
+*.md.bak
