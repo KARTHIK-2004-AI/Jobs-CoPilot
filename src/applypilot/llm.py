@@ -87,33 +87,11 @@ class LLMClient:
     def __init__(self, base_url: str, model: str, api_key: str) -> None:
         self.base_url = base_url
         self.model = model
-        # Support comma-separated API keys for rotation
-        self.api_keys: list[str] = [k.strip() for k in api_key.split(",") if k.strip()]
-        self.current_key_index = 0
+        self.api_key = api_key
         self._client = httpx.Client(timeout=_TIMEOUT)
+        # True once we've confirmed the native Gemini API works for this model
+        self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
-        # Default to native Gemini API to bypass OpenAI compatibility wrapper timeouts
-        self._use_native_gemini: bool = self._is_gemini
-
-    @property
-    def api_key(self) -> str:
-        """Get the currently active API key."""
-        if not self.api_keys:
-            return ""
-        return self.api_keys[self.current_key_index]
-
-    def rotate_key(self) -> bool:
-        """Rotate to the next API key. Returns True if rotated, False otherwise."""
-        if len(self.api_keys) <= 1:
-            return False
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        log.warning(
-            "Rotated API key to index %d/%d (starts with: %s...)",
-            self.current_key_index,
-            len(self.api_keys),
-            self.api_key[:10] if self.api_key else "None"
-        )
-        return True
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -221,9 +199,7 @@ class LLMClient:
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
 
-        max_retries = max(_MAX_RETRIES, len(self.api_keys) * 2)
-
-        for attempt in range(max_retries):
+        for attempt in range(_MAX_RETRIES):
             try:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
@@ -252,21 +228,7 @@ class LLMClient:
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
-                
-                # Check for rate limit, quota, or server error to trigger rotation if multiple keys exist
-                if resp.status_code in (400, 403, 429, 503) and len(self.api_keys) > 1:
-                    log.warning(
-                        "LLM request failed with status %d using key (starts with: %s). "
-                        "Response: %s. Attempting key rotation...",
-                        resp.status_code,
-                        self.api_key[:10] if self.api_key else "None",
-                        resp.text[:150]
-                    )
-                    if self.rotate_key():
-                        # Retry immediately with the new key (do not sleep)
-                        continue
-
-                if resp.status_code in (429, 503) and attempt < max_retries - 1:
+                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
                         resp.headers.get("Retry-After")
@@ -284,18 +246,18 @@ class LLMClient:
                         "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
                         "Tip: Gemini free tier = 15 RPM. Consider a paid account "
                         "or switching to a local model.",
-                        resp.status_code, wait, attempt + 1, max_retries,
+                        resp.status_code, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue
                 raise
 
             except httpx.TimeoutException:
-                if attempt < max_retries - 1:
+                if attempt < _MAX_RETRIES - 1:
                     wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
                     log.warning(
                         "LLM request timed out, retrying in %ds (attempt %d/%d)",
-                        wait, attempt + 1, max_retries,
+                        wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue

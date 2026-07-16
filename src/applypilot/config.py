@@ -175,9 +175,9 @@ def load_env():
     """Load environment variables from ~/.applypilot/.env if it exists."""
     from dotenv import load_dotenv
     if ENV_PATH.exists():
-        load_dotenv(ENV_PATH, override=True)
+        load_dotenv(ENV_PATH)
     # Also try CWD .env as fallback
-    load_dotenv(override=True)
+    load_dotenv()
 
 
 # ---------------------------------------------------------------------------
