@@ -33,16 +33,24 @@ def _detect_provider() -> tuple[str, str, str]:
     model_override = os.environ.get("LLM_MODEL", "")
 
     if gemini_key and not local_url:
+        model = model_override
+        if model and not (model.startswith("gemini-") or model.startswith("gemma-")):
+            log.warning("Discarding LLM_MODEL override '%s' for Gemini (must start with 'gemini-' or 'gemma-')", model)
+            model = ""
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
+            model or "gemini-2.0-flash",
             gemini_key,
         )
 
     if openai_key and not local_url:
+        model = model_override
+        if model and not (model.startswith("gpt-") or model.startswith("o1-") or model.startswith("o3-") or model.startswith("text-")):
+            log.warning("Discarding LLM_MODEL override '%s' for OpenAI (must start with 'gpt-', 'o1-', 'o3-', or 'text-')", model)
+            model = ""
         return (
             "https://api.openai.com/v1",
-            model_override or "gpt-4o-mini",
+            model or "gpt-4o-mini",
             openai_key,
         )
 
@@ -87,11 +95,28 @@ class LLMClient:
     def __init__(self, base_url: str, model: str, api_key: str) -> None:
         self.base_url = base_url
         self.model = model
-        self.api_key = api_key
+        self.api_keys = [k.strip() for k in api_key.split(",") if k.strip()] if api_key else [""]
+        self.current_key_index = 0
         self._client = httpx.Client(timeout=_TIMEOUT)
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+
+    @property
+    def api_key(self) -> str:
+        """Get the current active API key."""
+        return self.api_keys[self.current_key_index]
+
+    def rotate_key(self) -> None:
+        """Rotate to the next API key in the list."""
+        if len(self.api_keys) > 1:
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            log.info(
+                "Rotated API key to index %d/%d (starts with: %s...)",
+                self.current_key_index + 1,
+                len(self.api_keys),
+                self.api_key[:10] if self.api_key else "",
+            )
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -199,6 +224,8 @@ class LLMClient:
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
 
+        rotations_tried = 0
+
         for attempt in range(_MAX_RETRIES):
             try:
                 # Route to native Gemini if we've already confirmed it's needed
@@ -208,6 +235,18 @@ class LLMClient:
                 return self._chat_compat(messages, temperature, max_tokens)
 
             except _GeminiCompatForbidden as exc:
+                resp = exc.response
+                # If we have multiple keys and this is a 403, try rotating keys first
+                if len(self.api_keys) > 1 and rotations_tried < len(self.api_keys) - 1:
+                    log.warning(
+                        "Gemini compat returned 403 with key index %d. Attempting key rotation...",
+                        self.current_key_index + 1,
+                    )
+                    self.rotate_key()
+                    self._use_native_gemini = False
+                    rotations_tried += 1
+                    continue
+
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
@@ -220,6 +259,18 @@ class LLMClient:
                 try:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
                 except httpx.HTTPStatusError as native_exc:
+                    native_resp = native_exc.response
+                    if len(self.api_keys) > 1 and native_resp.status_code in (400, 401, 403, 429) and rotations_tried < len(self.api_keys) - 1:
+                        log.warning(
+                            "Gemini native returned %d with key index %d. Attempting key rotation...",
+                            native_resp.status_code,
+                            self.current_key_index + 1,
+                        )
+                        self.rotate_key()
+                        self._use_native_gemini = False
+                        rotations_tried += 1
+                        continue
+
                     raise RuntimeError(
                         f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
                         f"Native: {native_exc.response.status_code} — "
@@ -228,6 +279,19 @@ class LLMClient:
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
+                
+                # Check for rotation
+                if resp.status_code in (400, 401, 403, 429) and len(self.api_keys) > 1 and rotations_tried < len(self.api_keys) - 1:
+                    log.warning(
+                        "LLM request failed with status %d using key index %d. Attempting key rotation...",
+                        resp.status_code,
+                        self.current_key_index + 1,
+                    )
+                    self.rotate_key()
+                    self._use_native_gemini = False
+                    rotations_tried += 1
+                    continue
+
                 if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
