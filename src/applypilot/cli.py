@@ -87,6 +87,7 @@ def run(
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Maximum jobs to process in score/tailor/cover stages (0 for no limit)."),
     validation: str = typer.Option(
         "normal",
         "--validation",
@@ -136,6 +137,7 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        limit=limit,
     )
 
     if result.get("errors"):
